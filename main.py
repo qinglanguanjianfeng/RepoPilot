@@ -11,30 +11,38 @@ from openai.types.chat import (
 from collections.abc import Callable
 from openai.types.chat import ChatCompletion
 
+from workspace_paths import resolve_workspace_path
+
 # ========== 1. 基础配置 ==========
 
 MODEL = "deepseek-flash"
 MAX_STEPS = 6
-ALLOWED_FILE = "hello_agent.txt"
 
 WORKSPACE = Path(__file__).resolve().parent / "workspace"
 WORKSPACE.mkdir(exist_ok=True)
 
 
 # ========== 2. 定义 LLM 可用的工具 ==========
-
+# Tool Schema 负责指导 LLM 如何生成工具调用
 TOOLS: list[ChatCompletionToolParam] = [
     {
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "在工作区中写入文本文件。",
+            "description": (
+                "在 Workspace 内创建或覆盖文本文件。"
+                "可以自动创建不存在的父目录。"
+                "path 必须是 Workspace 内的相对路径。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "enum": ["hello_agent.txt"],
+                        "description": (
+                            "相对于 Workspace 的文件路径，"
+                            "例如 notes.txt 或 src/hello.py"
+                        ),
                     },
                     "content": {
                         "type": "string",
@@ -42,6 +50,7 @@ TOOLS: list[ChatCompletionToolParam] = [
                     },
                 },
                 "required": ["path", "content"],
+                "additionalProperties": False,
             },
         },
     },
@@ -49,16 +58,23 @@ TOOLS: list[ChatCompletionToolParam] = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "读取工作区内的文本文件。",
+            "description": (
+                "读取 Workspace 内的 UTF-8 文本文件。"
+                "path 必须是 Workspace 内的相对路径。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "enum": ["hello_agent.txt"],
+                        "description": (
+                            "相对于 Workspace 的文件路径，"
+                            "例如 notes.txt 或 src/hello.py"
+                        ),
                     },
                 },
                 "required": ["path"],
+                "additionalProperties": False,
             },
         },
     },
@@ -68,35 +84,63 @@ TOOLS: list[ChatCompletionToolParam] = [
 # ========== 3. 实际执行工具 ==========
 
 def execute_tool(name: str, arguments: dict[str, object]) -> str:
-    # MVP 阶段只允许操作指定文件
-    if arguments.get("path") != ALLOWED_FILE:
-        return "ERROR: 不允许操作该文件"
+    """执行 Workspace 内的文本文件操作。"""
 
-    file_path = WORKSPACE / ALLOWED_FILE
+    # 1. 检查工具名称
+    if name not in ("write_file","read_file"):
+        return f"Error: 未知工具 {name}"
 
-    # 防止通过已有符号链接访问工作区外的文件
-    if file_path.is_symlink():
-        return "ERROR: 不允许操作符号链接"
+    # 2. 检查路径参数类型
+    raw_path = arguments.get("path")
 
-    if name == "write_file":
-        content = arguments.get("content")
-        if not isinstance(content, str):
-            return "ERROR: content 必须是字符串"
+    if not isinstance(raw_path, str):
+        return "ERROR: path 必须是字符串"
 
-        file_path.write_text(content, encoding="utf-8")
-        return f"OK: {ALLOWED_FILE} 写入成功"
+    try:
+        # 3. 解析并校验 Workspace 路径
+        file_path = resolve_workspace_path(
+            WORKSPACE,
+            raw_path,
+        )
 
-    if name == "read_file":
-        if not file_path.is_file():
-            return "ERROR: 文件不存在"
+        # 4. 写入文件
+        if name == "write_file":
+            content = arguments.get("content")
 
-        return file_path.read_text(encoding="utf-8")
+            if not isinstance(content, str):
+                return "ERROR: content 必须是字符串"
+
+            # 自动创建不存在的父目录
+            file_path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            file_path.write_text(
+                content,
+                encoding="utf-8",
+            )
+
+            return f"OK: {raw_path} 写入成功"
+        # 5. 读取文件
+        if name == "read_file":
+            if not file_path.is_file():
+                return "ERROR: 文件不存在"
+
+            return file_path.read_text(
+                encoding="utf-8",
+            )
+
+    except (ValueError, OSError, UnicodeError) as exc:
+        return f"ERROR: {exc}"
 
     return f"ERROR: 未知工具 {name}"
+
 
 # ========== 4. Agent Loop ==========
 
 def run_agent(
+    user_task: str,
     llm_call: Callable[
         [list[ChatCompletionMessageParam]],
         ChatCompletion,
@@ -105,6 +149,12 @@ def run_agent(
 ) -> str:
     """运行 Agent Loop，由外部提供 LLM 调用函数。"""
 
+    # 1. 校验用户任务
+    user_task = user_task.strip()
+
+    if not user_task:
+        raise ValueError("用户任务不能为空")
+
     if max_steps < 1:
         raise ValueError("max_steps 必须大于 0")
 
@@ -112,20 +162,18 @@ def run_agent(
         {
             "role": "system",
             "content": (
-                "你是一个文件操作 Agent。"
-                "必须通过提供的工具实际执行文件操作。"
-                "当用户要求创建并验证文件时，"
-                "需要先写入文件，再使用 read_file 读取确认。"
-                "只有确认任务完成后才能输出最终回答。"
+                "你是一个能够操作 Workspace 内文本文件的 Coding Agent。"
+                "你可以通过 write_file 和 read_file 创建、修改和读取文件。"
+                "文件路径必须是 Workspace 内的相对路径，"
+                "例如 notes.txt 或 src/hello.py。"
+                "不允许访问 Workspace 外的文件。"
+                "执行文件操作时必须调用工具，不能虚构执行结果。"
+                "如果工具返回错误，应根据错误信息决定如何处理。"
             ),
         },
         {
             "role": "user",
-            "content": (
-                "请创建 hello_agent.txt，"
-                "写入 Hello RepoPilot，"
-                "然后读取文件，确认内容正确。"
-            ),
+            "content": user_task,
         },
     ]
 
@@ -233,9 +281,30 @@ def main() -> None:
         )
 
     # 将模型调用函数传入 Agent Loop
-    result = run_agent(llm_call=call_deepseek)  # 传递函数供 Agent Loop 调用
+        print("RepoPilot 已启动！输入 exit 或 quit 退出。")
 
-    print("\nAgent:", result)
+    while True:
+        try:
+            user_task = input("\nRepoPilot > ").strip()
+
+        except (KeyboardInterrupt, EOFError):
+            print("\n已退出 RepoPilot。")
+            break
+
+        if user_task.lower() in ("exit", "quit"):
+            print("已退出 RepoPilot。")
+            break
+
+        if not user_task:
+            print("请输入任务内容。")
+            continue
+
+        result = run_agent(
+            user_task=user_task,
+            llm_call=call_deepseek,
+        )
+
+        print("\nAgent:", result)
 
 if __name__ == "__main__":
     main()

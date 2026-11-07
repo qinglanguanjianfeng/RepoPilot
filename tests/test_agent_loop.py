@@ -99,6 +99,7 @@ def test_agent_loop_success(isolated_workspace: Path) -> None:
         return next(responses)
 
     result = main.run_agent(
+        user_task="请创建 hello_agent.txt 并验证内容",
         llm_call=fake_llm,
         max_steps=5,
     )
@@ -134,7 +135,11 @@ def test_tool_observation_in_history(
         history_snapshots.append(list(messages))
         return next(responses)
 
-    result = main.run_agent(fake_llm, max_steps=3)
+    result = main.run_agent(
+        user_task="请创建 hello_agent.txt 并验证内容",
+        llm_call=fake_llm,
+        max_steps=5,
+    )
 
     assert result == "任务完成"
     assert len(history_snapshots) == 2
@@ -168,6 +173,7 @@ def test_agent_max_steps(isolated_workspace: Path) -> None:
         )
 
     result = main.run_agent(
+        user_task="请创建 hello_agent.txt 并验证内容",
         llm_call=fake_llm,
         max_steps=2,
     )
@@ -198,8 +204,9 @@ def test_invalid_tool_arguments(
         return next(responses)
 
     result = main.run_agent(
+        user_task="请创建 hello_agent.txt 并验证内容",
         llm_call=fake_llm,
-        max_steps=3,
+        max_steps=5,
     )
 
     assert result == "已收到工具参数错误"
@@ -214,3 +221,60 @@ def test_invalid_tool_arguments(
     # 非法参数不应该生成文件
     assert not (isolated_workspace / "hello_agent.txt").exists()
 
+def test_dynamic_task_and_history_isolation() -> None:
+    """验证动态任务输入，以及不同任务的历史相互独立。"""
+
+    captured_histories: list[list[ChatCompletionMessageParam]] = []
+
+    def fake_llm(
+        messages: list[ChatCompletionMessageParam],
+    ) -> ChatCompletion:
+        captured_histories.append(list(messages))
+        return fake_completion(content="任务完成")
+
+    task_a = "请读取 hello_agent.txt"
+    task_b = "请修改 hello_agent.txt 的内容"
+
+    result_a = main.run_agent(
+        user_task=task_a,
+        llm_call=fake_llm,
+    )
+
+    result_b = main.run_agent(
+        user_task=task_b,
+        llm_call=fake_llm,
+    )
+
+    assert result_a == "任务完成"
+    assert result_b == "任务完成"
+
+    assert len(captured_histories) == 2
+
+    # 两次任务都应该从独立的消息历史开始
+    assert all(len(history) == 2 for history in captured_histories)
+
+    # 两次任务分别包含自己的用户输入
+    assert captured_histories[0][1] == {
+        "role": "user",
+        "content": task_a,
+    }
+
+    assert captured_histories[1][1] == {
+        "role": "user",
+        "content": task_b,
+    }
+
+
+def test_empty_user_task() -> None:
+    """验证 Agent 拒绝执行空任务。"""
+
+    def fake_llm(
+        messages: list[ChatCompletionMessageParam],
+    ) -> ChatCompletion:
+        raise AssertionError("空任务不应该触发 LLM 调用")
+
+    with pytest.raises(ValueError, match="用户任务不能为空"):
+        main.run_agent(
+            user_task="   ",
+            llm_call=fake_llm,
+        )
