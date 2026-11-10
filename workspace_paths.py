@@ -5,6 +5,8 @@ from pathlib import Path
 def resolve_workspace_path(
     workspace: Path,
     raw_path: str,
+    *,
+    allow_root: bool = False,
 ) -> Path:
     """将相对路径转换为 Workspace 内的绝对路径。"""
 
@@ -18,7 +20,7 @@ def resolve_workspace_path(
     if (
         relative_path.anchor
         or ".." in relative_path.parts
-        or relative_path == Path(".")
+        or (relative_path == Path(".") and not allow_root)
     ):
         raise ValueError("只允许 Workspace 内的相对文件路径")
 

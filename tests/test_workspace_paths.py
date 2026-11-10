@@ -84,3 +84,17 @@ def test_symlink_escape(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError):
         resolve_workspace_path(workspace, "linked/secret.txt")
+
+def test_allow_workspace_root(tmp_path: Path) -> None:
+    """只有明确允许时，才能返回 Workspace 根目录。"""
+
+    with pytest.raises(ValueError):
+        resolve_workspace_path(tmp_path, ".")
+
+    result = resolve_workspace_path(
+        tmp_path,
+        ".",
+        allow_root=True,
+    )
+
+    assert result == tmp_path.resolve()

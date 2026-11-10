@@ -78,7 +78,80 @@ TOOLS: list[ChatCompletionToolParam] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": (
+                "列出 Workspace 指定目录下的文件和子目录。"
+                "仅列出当前层级，不递归遍历。"
+                "如果未提供 path，则列出 Workspace 根目录。"
+                "返回结果包含文件和目录类型标记。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "相对于 Workspace 的目录路径。"
+                            "例如 .、src 或 src/utils。"
+                            "省略时默认使用根目录。"
+                        ),
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    }
+
 ]
+
+# LLM 的最大子文件（多种类）条目数量
+MAX_LIST_ENTRIES = 50
+
+def list_directory(
+    directory: Path,
+    relative_path: str,
+) -> str:
+    """列出一个目录的直接子项，不递归进入子目录。"""
+
+    if not directory.is_dir():
+        return "ERROR: 目录不存在或目标不是目录"
+
+    # 按文件名排序，保证输出顺序稳定
+    entries = sorted(
+        directory.iterdir(),
+        key=lambda path: path.name.casefold(),
+    )
+
+    if not entries:
+        return f"Directory: {relative_path}\n(空目录)"
+
+    lines = [f"Directory: {relative_path}"]
+
+    # 限制返回给 LLM 的条目数量
+    for entry in entries[:MAX_LIST_ENTRIES]:
+        if entry.is_symlink() or entry.is_junction():
+            lines.append(f"[LINK] {entry.name}")
+
+        elif entry.is_dir():
+            lines.append(f"[DIR]  {entry.name}/")
+
+        elif entry.is_file():
+            lines.append(f"[FILE] {entry.name}")
+
+        else:
+            lines.append(f"[OTHER] {entry.name}")
+
+    # 提示模型还有多少项没有返回
+    remaining = len(entries) - MAX_LIST_ENTRIES
+
+    if remaining > 0:
+        lines.append(f"... 另有 {remaining} 项未显示")
+
+    return "\n".join(lines)
 
 
 # ========== 3. 实际执行工具 ==========
@@ -87,11 +160,13 @@ def execute_tool(name: str, arguments: dict[str, object]) -> str:
     """执行 Workspace 内的文本文件操作。"""
 
     # 1. 检查工具名称
-    if name not in ("write_file","read_file"):
+    if name not in ("write_file","read_file", "list_files"):
         return f"Error: 未知工具 {name}"
 
-    # 2. 检查路径参数类型
-    raw_path = arguments.get("path")
+    # 2. 获取路径
+    # list_files 可以不提供 path，默认使用根目录
+    default_path = "." if name == "list_files" else None
+    raw_path = arguments.get("path", default_path)
 
     if not isinstance(raw_path, str):
         return "ERROR: path 必须是字符串"
@@ -101,9 +176,15 @@ def execute_tool(name: str, arguments: dict[str, object]) -> str:
         file_path = resolve_workspace_path(
             WORKSPACE,
             raw_path,
+            allow_root=(name == "list_files"),  
+            # 当工具是 list_files 时允许根目录，其他工具依然使用原来的限制
         )
 
-        # 4. 写入文件
+        # 4. 目录浏览
+        if name == "list_files":
+            return list_directory(file_path, raw_path)
+
+        # 5. 写入文件
         if name == "write_file":
             content = arguments.get("content")
 
@@ -122,7 +203,7 @@ def execute_tool(name: str, arguments: dict[str, object]) -> str:
             )
 
             return f"OK: {raw_path} 写入成功"
-        # 5. 读取文件
+        # 6. 读取文件
         if name == "read_file":
             if not file_path.is_file():
                 return "ERROR: 文件不存在"
@@ -163,12 +244,14 @@ def run_agent(
             "role": "system",
             "content": (
                 "你是一个能够操作 Workspace 内文本文件的 Coding Agent。"
-                "你可以通过 write_file 和 read_file 创建、修改和读取文件。"
-                "文件路径必须是 Workspace 内的相对路径，"
-                "例如 notes.txt 或 src/hello.py。"
-                "不允许访问 Workspace 外的文件。"
-                "执行文件操作时必须调用工具，不能虚构执行结果。"
-                "如果工具返回错误，应根据错误信息决定如何处理。"
+                "你有三个工具："
+                "list_files 用于查看目录结构；"
+                "read_file 用于读取文本文件；"
+                "write_file 用于创建或修改文本文件。"
+                "当需要了解有哪些文件时，应先使用 list_files。"
+                "所有路径都必须位于 Workspace 内。"
+                "文件操作必须通过工具执行，不允许虚构执行结果。"
+                "如果工具返回错误，应根据错误信息决定下一步行动。"
             ),
         },
         {
