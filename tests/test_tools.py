@@ -36,7 +36,8 @@ def test_read_file(isolated_workspace: Path) -> None:
         {"path": "hello_agent.txt"},
     )
 
-    assert result == "Hello RepoPilot"
+    assert "[L1] Hello RepoPilot" in result
+    assert "[EOF]" in result
 
 
 def test_read_missing_file(isolated_workspace: Path) -> None:
@@ -45,7 +46,7 @@ def test_read_missing_file(isolated_workspace: Path) -> None:
         {"path": "hello_agent.txt"},
     )
 
-    assert result == "ERROR: 文件不存在"
+    assert result == "ERROR: 文件不存在或目标不是普通文件"
 
 
 def test_invalid_path(isolated_workspace: Path) -> None:
@@ -125,7 +126,8 @@ def test_nested_file(isolated_workspace: Path) -> None:
         {"path": path},
     )
 
-    assert read_result == content
+    assert "[L1] def add(a, b):" in read_result
+    assert "[L2]     return a + b" in read_result
 
 
 def test_reject_absolute_path(isolated_workspace: Path) -> None:

@@ -18,6 +18,7 @@ from workspace_paths import resolve_workspace_path
 MODEL = "deepseek-flash"
 MAX_STEPS = 6
 
+
 WORKSPACE = Path(__file__).resolve().parent / "workspace"
 WORKSPACE.mkdir(exist_ok=True)
 
@@ -59,8 +60,12 @@ TOOLS: list[ChatCompletionToolParam] = [
         "function": {
             "name": "read_file",
             "description": (
-                "读取 Workspace 内的 UTF-8 文本文件。"
-                "path 必须是 Workspace 内的相对路径。"
+                "按行读取 Workspace 内的 UTF-8 文本文件。"
+                "默认读取前 60 行。"
+                "可以通过 start_line 和 end_line 指定读取范围，"
+                "结束行包含在读取范围内。"
+                "每次最多读取 120 行，返回带行号的文本。"
+                "当结果提示还有后续内容时，可以继续分段读取。"
             ),
             "parameters": {
                 "type": "object",
@@ -71,6 +76,16 @@ TOOLS: list[ChatCompletionToolParam] = [
                             "相对于 Workspace 的文件路径，"
                             "例如 notes.txt 或 src/hello.py"
                         ),
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "起始行号，从 1 开始，默认 1",
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "结束行号，包含该行；省略时默认读取 60 行",
                     },
                 },
                 "required": ["path"],
@@ -110,6 +125,9 @@ TOOLS: list[ChatCompletionToolParam] = [
 
 # LLM 的最大子文件（多种类）条目数量
 MAX_LIST_ENTRIES = 50
+DEFAULT_READ_LINES = 60
+MAX_READ_LINES = 120
+MAX_READ_CHARS = 8000
 
 def list_directory(
     directory: Path,
@@ -152,6 +170,96 @@ def list_directory(
         lines.append(f"... 另有 {remaining} 项未显示")
 
     return "\n".join(lines)
+
+
+def read_file_chunk(
+    file_path: Path,
+    display_path: str,
+    start_line: int,
+    end_line: int,
+) -> str:
+    """分段读取文本文件，返回带行号且受字符数限制的内容。"""
+
+    if not file_path.is_file():
+        return "ERROR: 文件不存在或目标不是普通文件"
+
+    header = (
+        f"File: {display_path}\n"
+        f"Requested lines: {start_line}-{end_line}\n"
+    )
+
+    # 为结尾状态信息预留空间
+    char_budget = MAX_READ_CHARS - len(header) - 160
+
+    if char_budget <= 0:
+        return "ERROR: 输出字符限制配置不合理"
+
+    output_lines: list[str] = []
+    used_chars = 0
+    found_start = False
+    next_line: int | None = None
+
+    # 逐行读取，不使用 read_text() 加载整个文件
+    with file_path.open("r", encoding="utf-8") as file:
+        for line_number, raw_line in enumerate(file, start=1):
+
+            # 跳过起始行之前的内容
+            if line_number < start_line:
+                continue
+
+            # 超过请求的结束行，停止读取
+            if line_number > end_line:
+                next_line = line_number
+                break
+
+            found_start = True
+
+            # 移除行尾换行符，添加行号
+            content = raw_line.rstrip("\r\n")
+            formatted = f"[L{line_number}] {content}\n"
+
+            # 检查字符预算
+            if used_chars + len(formatted) > char_budget:
+
+                # 单行就超过预算时，明确报错
+                if not output_lines:
+                    return (
+                        f"ERROR: 第 {line_number} 行过长，"
+                        "无法在单次字符限制内完整显示。"
+                        "当前版本不支持单行内部的分片读取。"
+                    )
+
+                # 本行尚未返回，下次应从本行继续
+                next_line = line_number
+                break
+
+            output_lines.append(formatted)
+            used_chars += len(formatted)
+
+    # 文件为空，或者起始行超出范围
+    if not found_start:
+        if start_line == 1:
+            return header + "(空文件)\n[EOF]"
+
+        return "ERROR: start_line 超出文件实际行数"
+
+    # 给模型提供下一步读取提示
+    if next_line is None:
+        footer = "[EOF] 已到达文件末尾"
+
+    elif next_line > end_line:
+        footer = (
+            f"[MORE] 文件仍有后续内容，"
+            f"可从 start_line={next_line} 继续读取"
+        )
+
+    else:
+        footer = (
+            f"[TRUNCATED] 已达到单次输出字符限制，"
+            f"可从 start_line={next_line} 继续读取"
+        )
+
+    return header + "".join(output_lines) + footer
 
 
 # ========== 3. 实际执行工具 ==========
@@ -204,13 +312,53 @@ def execute_tool(name: str, arguments: dict[str, object]) -> str:
 
             return f"OK: {raw_path} 写入成功"
         # 6. 读取文件
+        
         if name == "read_file":
-            if not file_path.is_file():
-                return "ERROR: 文件不存在"
 
-            return file_path.read_text(
-                encoding="utf-8",
+            # 1. 获取起始行
+            start_line = arguments.get("start_line", 1)
+
+            if not isinstance(start_line, int) or isinstance(start_line, bool):
+                return "ERROR: start_line 必须是整数"
+
+            if start_line < 1:
+                return "ERROR: start_line 必须大于等于 1"
+
+            # 2. 获取结束行
+            end_line_value = arguments.get("end_line")
+
+            if end_line_value is None:
+                end_line = start_line + DEFAULT_READ_LINES - 1
+
+            else:
+                if (
+                    not isinstance(end_line_value, int)
+                    or isinstance(end_line_value, bool)
+                ):
+                    return "ERROR: end_line 必须是整数"
+
+                end_line = end_line_value
+
+            # 3. 校验读取范围
+            if end_line < start_line:
+                return "ERROR: end_line 不能小于 start_line"
+
+            requested_lines = end_line - start_line + 1
+
+            if requested_lines > MAX_READ_LINES:
+                return (
+                    f"ERROR: 单次最多读取 {MAX_READ_LINES} 行，"
+                    "请缩小读取范围"
+                )
+
+            # 4. 执行分段读取
+            return read_file_chunk(
+                file_path=file_path,
+                display_path=raw_path,
+                start_line=start_line,
+                end_line=end_line,
             )
+
 
     except (ValueError, OSError, UnicodeError) as exc:
         return f"ERROR: {exc}"
@@ -252,6 +400,12 @@ def run_agent(
                 "所有路径都必须位于 Workspace 内。"
                 "文件操作必须通过工具执行，不允许虚构执行结果。"
                 "如果工具返回错误，应根据错误信息决定下一步行动。"
+                "read_file 支持按行分段读取，"
+                "每次最多读取 120 行。"
+                "对于较长文件，应根据需要使用 start_line 和 end_line。"
+                "如果工具返回 [MORE] 或 [TRUNCATED]，"
+                "可以按照提示继续读取。"
+                "不能将未读取的文件内容当作已知事实。"
             ),
         },
         {
